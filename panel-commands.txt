@@ -30,3 +30,23 @@ pm2 restart nyodera || ./start-panel.sh
 # Notes:
 # - If you prefer, run ./start-panel.sh to perform install/test/start automatically.
 # - If you have trouble copying on mobile, open this file in the GitHub repo and use the Copy button on the web UI.
+
+# Quick: force local JSON storage (useful when panel DB is offline)
+# Option A (recommended when offline): copy deploy.env which already sets FORCE_JSON_STORAGE=true
+#
+#   cp -f deploy.env .env
+#   ./start-panel.sh
+#
+# Option B (manually toggle in existing .env): comment DB lines or set flag
+#   # backup existing env
+#   cp .env .env.bak.$(date +%s)
+#   # enable JSON-only mode
+#   grep -vE '^(MYSQL_|DATABASE_URL|DATABASE_TYPE=)' .env.bak.$(date +%s) > .env.tmp || true
+#   echo "FORCE_JSON_STORAGE=true" >> .env.tmp
+#   mv .env.tmp .env
+#   ./start-panel.sh
+
+# Quick health checks (run after app is running):
+#   curl -s http://127.0.0.1:4242/health
+#   curl -s http://127.0.0.1:4242/config
+#   curl -s http://127.0.0.1:4242/api/users | jq .
