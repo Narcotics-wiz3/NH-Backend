@@ -1250,18 +1250,44 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Missing name, email, or password' });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = String(email).trim().toLowerCase();
     const users = await readUsersFromFile();
     const existingUser = users.find(u => u.email === normalizedEmail);
     if (existingUser) {
       return res.status(409).json({ error: 'Email already registered' });
     }
 
-    const user = { name: name.trim(), email: normalizedEmail, password, role: 'user', verified: false };
+    const now = Date.now();
+    const otp = ('' + Math.floor(100000 + Math.random() * 900000));
+    const user = {
+      name: String(name).trim(),
+      email: normalizedEmail,
+      password,
+      role: 'user',
+      verified: false,
+      otp,
+      otpExpires: now + (10 * 60 * 1000),
+      lastOtpSentAt: now,
+    };
     users.push(user);
     await saveUsersToFile(users);
 
-    res.json({ email: user.email, name: user.name, role: user.role, verified: false });
+    let emailSend = { mode: 'unknown' };
+    try {
+      emailSend = await sendOtpEmail({ email: user.email, name: user.name, otp });
+    } catch (err) {
+      console.error('Failed to send signup verification OTP email', err);
+      emailSend = { error: err.message || 'Unknown send error' };
+    }
+
+    res.json({
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      verified: false,
+      requiresVerification: true,
+      emailSend,
+    });
   } catch (err) {
     console.error('signup error', err);
     res.status(500).json({ error: 'Unable to sign up user' });
