@@ -87,18 +87,30 @@ if (!pool) {
   useDb = false;
 }
 
+function disableDbMode(reason) {
+  if (!useDb) return;
+  console.warn('Disabling database mode due to error:', reason);
+  useDb = false;
+  pool = null;
+}
+
 async function dbQuery(text, params = []) {
   if (!useDb || !pool) throw new Error('Database not configured');
-  if (dbClientType === 'pg') {
-    return pool.query(text, params);
-  }
+  try {
+    if (dbClientType === 'pg') {
+      return await pool.query(text, params);
+    }
 
-  // Convert Postgres $n placeholders to MySQL ? placeholders
-  const sql = text.replace(/\$(\d+)/g, '?');
-  // Convert JS objects to JSON strings for JSON columns
-  const safeParams = params.map(p => (p && typeof p === 'object') ? JSON.stringify(p) : p);
-  const [rows] = await pool.execute(sql, safeParams);
-  return { rows, rowCount: Array.isArray(rows) ? rows.length : 0 };
+    // Convert Postgres $n placeholders to MySQL ? placeholders
+    const sql = text.replace(/\$(\d+)/g, '?');
+    // Convert JS objects to JSON strings for JSON columns
+    const safeParams = params.map(p => (p && typeof p === 'object') ? JSON.stringify(p) : p);
+    const [rows] = await pool.execute(sql, safeParams);
+    return { rows, rowCount: Array.isArray(rows) ? rows.length : 0 };
+  } catch (err) {
+    disableDbMode(err.message || err);
+    throw err;
+  }
 }
 
 function loadJsonData(filePath) {
@@ -1614,7 +1626,14 @@ async function startServer() {
     console.error('Database initialization failed, falling back to local JSON storage:', err.message || err);
     console.warn('Continuing startup in JSON file mode. Set a valid MySQL or PostgreSQL configuration to enable database storage.');
   }
-  await ensureDefaultAdminUser();
+
+  try {
+    await ensureDefaultAdminUser();
+  } catch (err) {
+    console.error('Admin user initialization failed:', err.message || err);
+    console.warn('Continuing startup with local JSON storage even though admin initialization failed.');
+  }
+
   return new Promise((resolve) => {
     const server = app.listen(PORT, HOST, () => {
       console.log(`Nyodera Heights API backend listening on http://${HOST}:${PORT}`);
