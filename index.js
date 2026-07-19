@@ -9,6 +9,7 @@ const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
+const mysql = require('mysql2/promise');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -35,15 +36,66 @@ const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
 const PROPERTIES_FILE = path.join(__dirname, 'properties.json');
 const ROOM_SERVICES_FILE = path.join(__dirname, 'room_services.json');
 
-const useDb = Boolean(process.env.DATABASE_URL);
-const pool = useDb ? new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
-}) : null;
+// Determine DB type and create an appropriate pool (Postgres or MySQL)
+const envDbType = (process.env.DATABASE_TYPE || '').toLowerCase();
+const inferredType = process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('mysql') ? 'mysql' : 'pg';
+const dbClientType = envDbType === 'mysql' ? 'mysql' : (envDbType === 'pg' || envDbType === 'postgres' ? 'pg' : (process.env.DATABASE_URL ? inferredType : null));
+const useDb = Boolean(dbClientType);
+let pool = null;
+if (dbClientType === 'pg') {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+  });
+} else if (dbClientType === 'mysql') {
+  // Build mysql config from MYSQL_* env vars or from DATABASE_URL / JDBC_DATABASE_URL
+  const mysqlConfig = {};
+  if (process.env.MYSQL_HOST) {
+    mysqlConfig.host = process.env.MYSQL_HOST;
+    mysqlConfig.port = parseInt(process.env.MYSQL_PORT || '3306', 10);
+    mysqlConfig.user = process.env.MYSQL_USER;
+    mysqlConfig.password = process.env.MYSQL_PASSWORD;
+    mysqlConfig.database = process.env.MYSQL_DATABASE;
+  } else if (process.env.DATABASE_URL) {
+    try {
+      const u = new URL(process.env.DATABASE_URL.replace(/^jdbc:/, ''));
+      mysqlConfig.host = u.hostname;
+      mysqlConfig.port = parseInt(u.port || '3306', 10);
+      mysqlConfig.user = decodeURIComponent(u.username || '');
+      mysqlConfig.password = decodeURIComponent(u.password || '');
+      mysqlConfig.database = (u.pathname || '').replace('/', '');
+    } catch (err) {
+      // ignore
+    }
+  } else if (process.env.JDBC_DATABASE_URL) {
+    try {
+      const u = new URL(process.env.JDBC_DATABASE_URL.replace(/^jdbc:/, ''));
+      mysqlConfig.host = u.hostname;
+      mysqlConfig.port = parseInt(u.port || '3306', 10);
+      mysqlConfig.user = decodeURIComponent(u.username || '');
+      mysqlConfig.password = decodeURIComponent(u.password || '');
+      mysqlConfig.database = (u.pathname || '').replace('/', '');
+    } catch (err) {
+      // ignore
+    }
+  }
+  if (Object.keys(mysqlConfig).length > 0) {
+    pool = mysql.createPool(Object.assign({ waitForConnections: true, connectionLimit: 10 }, mysqlConfig));
+  }
+}
 
 async function dbQuery(text, params = []) {
-  if (!useDb) throw new Error('Database not configured');
-  return pool.query(text, params);
+  if (!useDb || !pool) throw new Error('Database not configured');
+  if (dbClientType === 'pg') {
+    return pool.query(text, params);
+  }
+
+  // Convert Postgres $n placeholders to MySQL ? placeholders
+  const sql = text.replace(/\$(\d+)/g, '?');
+  // Convert JS objects to JSON strings for JSON columns
+  const safeParams = params.map(p => (p && typeof p === 'object') ? JSON.stringify(p) : p);
+  const [rows] = await pool.execute(sql, safeParams);
+  return { rows, rowCount: Array.isArray(rows) ? rows.length : 0 };
 }
 
 function loadJsonData(filePath) {
@@ -59,79 +111,127 @@ function loadJsonData(filePath) {
 
 async function initStorage() {
   if (!useDb) {
-    console.warn('DATABASE_URL not set. Using local JSON files for storage.');
+    console.warn('Database not configured. Using local JSON files for storage.');
     return;
   }
 
-  await dbQuery(`CREATE TABLE IF NOT EXISTS users (
+  if (dbClientType === 'pg') {
+    await dbQuery(`CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
       payload JSONB NOT NULL
     )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS properties (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS properties (
       id TEXT PRIMARY KEY,
       payload JSONB NOT NULL
     )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS bookings (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS bookings (
       id TEXT PRIMARY KEY,
       user_email TEXT,
       payload JSONB NOT NULL
     )`);
-  await dbQuery(`CREATE TABLE IF NOT EXISTS room_services (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS room_services (
       id TEXT PRIMARY KEY,
       booking_id TEXT,
       user_email TEXT,
       payload JSONB NOT NULL
     )`);
+  } else if (dbClientType === 'mysql') {
+    await dbQuery(`CREATE TABLE IF NOT EXISTS users (
+      email VARCHAR(255) PRIMARY KEY,
+      payload JSON NOT NULL
+    )`);
+    await dbQuery(`CREATE TABLE IF NOT EXISTS properties (
+      id VARCHAR(255) PRIMARY KEY,
+      payload JSON NOT NULL
+    )`);
+    await dbQuery(`CREATE TABLE IF NOT EXISTS bookings (
+      id VARCHAR(255) PRIMARY KEY,
+      user_email VARCHAR(255),
+      payload JSON NOT NULL
+    )`);
+    await dbQuery(`CREATE TABLE IF NOT EXISTS room_services (
+      id VARCHAR(255) PRIMARY KEY,
+      booking_id VARCHAR(255),
+      user_email VARCHAR(255),
+      payload JSON NOT NULL
+    )`);
+  }
 
-  const usersRows = await dbQuery('SELECT 1 FROM users LIMIT 1');
-  if (usersRows.rowCount === 0) {
+  // Seed data if empty
+  const usersRows = await dbQuery(dbClientType === 'pg' ? 'SELECT 1 FROM users LIMIT 1' : 'SELECT 1 FROM users LIMIT 1');
+  if ((usersRows.rowCount || (Array.isArray(usersRows.rows) && usersRows.rows.length)) === 0) {
     const seedUsers = loadJsonData(USERS_FILE);
     for (const user of seedUsers) {
-      await dbQuery('INSERT INTO users(email,payload) VALUES($1,$2) ON CONFLICT (email) DO UPDATE SET payload = EXCLUDED.payload', [user.email, user]);
+      await upsertRow('users', 'email', user.email, user);
     }
   }
 
   const propertiesRows = await dbQuery('SELECT 1 FROM properties LIMIT 1');
-  if (propertiesRows.rowCount === 0) {
+  if ((propertiesRows.rowCount || (Array.isArray(propertiesRows.rows) && propertiesRows.rows.length)) === 0) {
     const seedProperties = loadJsonData(PROPERTIES_FILE);
     for (const property of seedProperties) {
-      await dbQuery('INSERT INTO properties(id,payload) VALUES($1,$2) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(property.id), property]);
+      await upsertRow('properties', 'id', String(property.id), property);
     }
   }
 
   const bookingsRows = await dbQuery('SELECT 1 FROM bookings LIMIT 1');
-  if (bookingsRows.rowCount === 0) {
+  if ((bookingsRows.rowCount || (Array.isArray(bookingsRows.rows) && bookingsRows.rows.length)) === 0) {
     const seedBookings = loadJsonData(BOOKINGS_FILE);
     for (const booking of seedBookings) {
-      await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
+      if (dbClientType === 'pg') {
+        await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
+      } else {
+        await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(booking.id), booking.userEmail || null, booking]);
+      }
     }
   }
 
   const servicesRows = await dbQuery('SELECT 1 FROM room_services LIMIT 1');
-  if (servicesRows.rowCount === 0) {
+  if ((servicesRows.rowCount || (Array.isArray(servicesRows.rows) && servicesRows.rows.length)) === 0) {
     const seedServices = loadJsonData(ROOM_SERVICES_FILE);
     for (const service of seedServices) {
-      await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+      if (dbClientType === 'pg') {
+        await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+      } else {
+        await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+      }
     }
   }
 }
 
 async function upsertRow(table, idColumn, idValue, payload) {
-  if (!useDb) {
-    throw new Error('Database not configured');
+  if (!useDb) throw new Error('Database not configured');
+
+  if (dbClientType === 'pg') {
+    return dbQuery(
+      `INSERT INTO ${table}(${idColumn}, payload) VALUES($1, $2)
+        ON CONFLICT (${idColumn}) DO UPDATE SET payload = EXCLUDED.payload`,
+      [idValue, payload]
+    );
   }
 
+  // MySQL
   return dbQuery(
     `INSERT INTO ${table}(${idColumn}, payload) VALUES($1, $2)
-      ON CONFLICT (${idColumn}) DO UPDATE SET payload = EXCLUDED.payload`,
+      ON DUPLICATE KEY UPDATE payload = VALUES(payload)`,
     [idValue, payload]
   );
 }
 
 async function readUsersFromFile() {
   if (!useDb) return loadJsonData(USERS_FILE);
-  const { rows } = await dbQuery('SELECT payload FROM users ORDER BY payload->>\'email\'');
-  return rows.map(row => row.payload);
+  let res;
+  if (dbClientType === 'pg') {
+    res = await dbQuery("SELECT payload FROM users ORDER BY payload->>'email'");
+    const rows = res.rows || res;
+    return rows.map(r => r.payload);
+  }
+  // MySQL
+  res = await dbQuery("SELECT payload FROM users ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.email'))");
+  const rows = res.rows || res;
+  return rows.map(r => {
+    try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; }
+  });
 }
 
 async function saveUsersToFile(users) {
@@ -152,14 +252,24 @@ async function saveUsersToFile(users) {
 
 async function readBookingsFromFile() {
   if (!useDb) return loadJsonData(BOOKINGS_FILE);
-  const { rows } = await dbQuery('SELECT payload FROM bookings ORDER BY payload->>\'id\'');
-  return rows.map(row => row.payload);
+  if (dbClientType === 'pg') {
+    const { rows } = await dbQuery("SELECT payload FROM bookings ORDER BY payload->>'id'");
+    return rows.map(row => row.payload);
+  }
+  const res = await dbQuery("SELECT payload FROM bookings ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
+  const rows = res.rows || res;
+  return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
 }
 
 async function readPropertiesFromFile() {
   if (!useDb) return loadJsonData(PROPERTIES_FILE);
-  const { rows } = await dbQuery('SELECT payload FROM properties ORDER BY payload->>\'id\'');
-  return rows.map(row => row.payload);
+  if (dbClientType === 'pg') {
+    const { rows } = await dbQuery("SELECT payload FROM properties ORDER BY payload->>'id'");
+    return rows.map(row => row.payload);
+  }
+  const res = await dbQuery("SELECT payload FROM properties ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
+  const rows = res.rows || res;
+  return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
 }
 
 async function savePropertiesToFile(properties) {
@@ -190,14 +300,23 @@ async function saveBookingsToFile(bookings) {
   }
 
   for (const booking of bookings) {
-    await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
+    if (dbClientType === 'pg') {
+      await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
+    } else {
+      await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(booking.id), booking.userEmail || null, booking]);
+    }
   }
 }
 
 async function readRoomServicesFromFile() {
   if (!useDb) return loadJsonData(ROOM_SERVICES_FILE);
-  const { rows } = await dbQuery('SELECT payload FROM room_services ORDER BY payload->>\'id\'');
-  return rows.map(row => row.payload);
+  if (dbClientType === 'pg') {
+    const { rows } = await dbQuery("SELECT payload FROM room_services ORDER BY payload->>'id'");
+    return rows.map(row => row.payload);
+  }
+  const res = await dbQuery("SELECT payload FROM room_services ORDER BY JSON_UNQUOTE(JSON_EXTRACT(payload, '$.id'))");
+  const rows = res.rows || res;
+  return rows.map(r => { try { return typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload; } catch (e) { return r.payload; } });
 }
 
 async function saveRoomServicesToFile(services) {
@@ -212,7 +331,11 @@ async function saveRoomServicesToFile(services) {
   }
 
   for (const service of services) {
-    await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+    if (dbClientType === 'pg') {
+      await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+    } else {
+      await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON DUPLICATE KEY UPDATE payload = VALUES(payload)', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+    }
   }
 }
 
