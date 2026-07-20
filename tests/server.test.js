@@ -42,6 +42,26 @@ test('health endpoint responds without payment secrets configured', async () => 
   }
 });
 
+test('config endpoint exposes current email configuration state', async () => {
+  const server = await startServer();
+
+  try {
+    const address = server.address();
+    const response = await fetch(`http://127.0.0.1:${address.port}/config`);
+    const body = await response.json();
+
+    const hasSmtp = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+    const hasApi = Boolean(process.env.EMAIL_API_URL && process.env.EMAIL_API_KEY);
+    const expectedConfigured = hasSmtp || hasApi;
+
+    assert.equal(response.status, 200);
+    assert.equal(body.emailConfigured, expectedConfigured);
+    assert.equal(body.emailFrom, process.env.EMAIL_FROM || 'no-reply@nyoderaheights.com');
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test('signup creates a verification flow and login works after verification', async () => {
   const server = await startServer();
   const email = 'auth-flow-test@example.com';

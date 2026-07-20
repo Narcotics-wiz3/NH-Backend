@@ -1,4 +1,4 @@
-require('dotenv').config();
+const dotenv = require('dotenv');
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
@@ -10,6 +10,21 @@ const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 const mysql = require('mysql2/promise');
+
+dotenv.config();
+
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const parsed = dotenv.parse(fs.readFileSync(filePath, 'utf8'));
+  Object.entries(parsed).forEach(([key, value]) => {
+    if (process.env[key] == null || process.env[key] === '') {
+      process.env[key] = value;
+    }
+  });
+}
+
+loadEnvFile(path.join(__dirname, '.env'));
+loadEnvFile(path.join(__dirname, 'deploy.env'));
 
 const app = express();
 app.set('trust proxy', 1);
@@ -788,12 +803,28 @@ app.get('/checkout-session/:id', async (req, res) => {
 });
 
 // Public config endpoint to return non-secret keys to the client
-app.get('/config', (req, res) => {
-  res.json({
-    stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null,
-    paypalClientId: process.env.PAYPAL_CLIENT_ID || null,
-    mpesaEnabled: true
-  });
+app.get('/config', async (req, res) => {
+  try {
+    const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+    const apiConfigured = Boolean(process.env.EMAIL_API_URL && process.env.EMAIL_API_KEY);
+    const provider = process.env.EMAIL_PROVIDER === 'unione' && process.env.EMAIL_API_KEY ? 'unione' : (apiConfigured ? 'api' : (smtpConfigured ? 'smtp' : 'ethereal'));
+    const { mode } = await getMailTransporter();
+    res.json({
+      stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null,
+      paypalClientId: process.env.PAYPAL_CLIENT_ID || null,
+      mpesaEnabled: true,
+      emailConfigured: smtpConfigured || apiConfigured,
+      emailMode: mode,
+      emailFrom: process.env.EMAIL_FROM || 'no-reply@nyoderaheights.com',
+      smtpConfigured,
+      apiConfigured,
+      provider,
+      emailFallbackEnabled: mode === 'ethereal',
+    });
+  } catch (err) {
+    console.error('config error', err);
+    res.status(500).json({ error: 'Unable to load config' });
+  }
 });
 
 app.get('/api/users', async (req, res) => {
