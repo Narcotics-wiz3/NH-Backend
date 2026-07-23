@@ -29,21 +29,33 @@ loadEnvFile(path.join(__dirname, 'deploy.env'));
 const app = express();
 app.set('trust proxy', 1);
 
-const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || `${process.env.FRONTEND_URL || ''},http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://panel.bwmxmd.co.ke`)
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || `${process.env.FRONTEND_URL || ''},https://narcotics-wiz3.github.io,http://localhost:5500,http://127.0.0.1:5500,https://panel.bwmxmd.co.ke`)
   .split(',')
   .map(origin => origin.trim())
   .filter(Boolean);
 
-app.use(cors({
+const corsOptions = {
   origin(origin, callback) {
     if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) return callback(null, true);
+
+    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+      return callback(null, true);
+    }
+
     const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
     if (isLocalhost) return callback(null, true);
-    callback(null, false);
+
+    return callback(null, false);
   },
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-}));
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
 const USERS_FILE = path.join(__dirname, 'users.json');
