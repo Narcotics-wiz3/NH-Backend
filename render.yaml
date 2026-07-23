@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: nyodera-heights-api
+    env: node
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: FORCE_JSON_STORAGE
+        value: true
